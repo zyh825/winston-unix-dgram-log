@@ -14,7 +14,11 @@ const levels = Object.keys({
   emerg: 7
 });
 
-const UnixDgramLog = function (options = {}) {
+const noop = () => {};
+
+const MAX_CACHED_LOGS = 10000;
+
+const UnixDgramLog = function UnixDgramLog(options = {}) {
   winston.Transport.call(this, options);
 
   // Extract options
@@ -32,7 +36,7 @@ const UnixDgramLog = function (options = {}) {
   this.inFlight = 0;
 
   // Setup log producer
-  this.producer = options.produce || {};
+  this.producer = options.producer || {};
   this.prefix = options.prefix;
   // Setup socket
   this.socket = null;
@@ -49,11 +53,12 @@ UnixDgramLog.prototype.log = function log(level, msg, meta, callback) {
     return callback(new Error(`Cannot log unknown syslog level: ${level}`));
   }
 
-  let syslogMsg = JSON.stringify(Object.assign({
+  let syslogMsg = JSON.stringify({
     time: moment().toISOString(),
     level: level.toUpperCase(),
-    log: msg
-  }, this.producer));
+    log: msg,
+    ...this.producer
+  });
 
   if (typeof this.prefix === 'string') {
     syslogMsg = `${this.prefix}${syslogMsg}`;
@@ -63,7 +68,7 @@ UnixDgramLog.prototype.log = function log(level, msg, meta, callback) {
 
   const onError = logErr => {
     if (logErr) {
-      this.queue.push(syslogMsg);
+      this.cacheLog(syslogMsg);
     }
     this.emit('logged');
     this.inFlight--;
@@ -75,12 +80,12 @@ UnixDgramLog.prototype.log = function log(level, msg, meta, callback) {
 
   this.connect(err => {
     if (err) {
-      this.queue.push(syslogMsg);
+      this.cacheLog(syslogMsg);
       return callback(err);
     }
     const buffer = new Buffer(syslogMsg);
     if (this.congested) {
-      this.queue.push(syslogMsg);
+      this.cacheLog(syslogMsg);
     } else {
       this.socket.once('congestion', onCongestion);
       this.socket.once('error', onError);
@@ -91,6 +96,14 @@ UnixDgramLog.prototype.log = function log(level, msg, meta, callback) {
       });
     }
   });
+};
+
+UnixDgramLog.prototype.cacheLog = function cacheLog(syslogMsg) {
+  // maintain a queue to avoid losing logs when connection fails
+  if (this.queue.length > MAX_CACHED_LOGS) {
+    this.queue.shift();
+  }
+  this.queue.push(syslogMsg);
 };
 
 UnixDgramLog.prototype.close = function close() {
@@ -121,7 +134,7 @@ UnixDgramLog.prototype.flushQueue = function flushQueue() {
   this.queue.splice(0, sentMsgs);
 };
 
-UnixDgramLog.prototype.connect = function connect(callback) {
+UnixDgramLog.prototype.connect = function connect(callback = noop) {
   if (this.socket) {
     return !this.socket.readyState || this.socket.readyState === 'open'
       ? callback(null)
@@ -129,12 +142,14 @@ UnixDgramLog.prototype.connect = function connect(callback) {
   }
 
   this.socket = unix.createSocket('unix_dgram');
+
   this.socket.on('error', err => {
     if (err.syscall === 'connect') {
       this.socket.close();
       this.socket = null;
       callback(err);
     }
+
     if (err.syscall === 'send') {
       this.socket.close();
       this.socket = null;
@@ -143,7 +158,21 @@ UnixDgramLog.prototype.connect = function connect(callback) {
     this.emit('error', err);
   });
 
+  this.socket.on('close', () => {
+    // Attempt to reconnect on lost connection(s), progressively
+    // increasing the amount of time between each try.
+    const interval = Math.pow(2, this.retries);
+    this.congested = false;
+    setTimeout(() => {
+      this.retries++;
+      this.connect();
+    }, interval * 1000);
+  });
+
   this.socket.on('connect', () => {
+    this.retries = 0;
+    this.congested = true;
+
     this.socket.on('congestion', () => {
       this.congested = true;
     });
